@@ -1,0 +1,208 @@
+---
+- name: Main
+  hosts: all
+  gather_facts: false
+  become: yes
+  tasks:
+    - set_fact:
+        jre_name=java-1.8.0-openjdk
+      when: ansible_distribution == 'CentOS'
+      tags: install
+    
+    - set_fact:
+        jre_name=openjdk-8-jre
+      when: ansible_distribution == 'Debian' or ansible_distribution == 'Ubuntu'
+      tags: install
+    
+    - fail:
+        msg: Unsupported distro, use Debian, Ubuntu or CentOS instead
+      when: jre_name is not defined 
+      tags: install
+    
+    - name: Install Java 8
+      package:
+        name: "{{ jre_name }}"
+      tags: install
+
+    - block:
+        - rpm_key:
+            key: https://packages.cloud.google.com/yum/doc/yum-key.gpg
+        - rpm_key:
+            key: https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+        - yum_repository:
+            name: google-cloud-sdk
+            description: Google Cloud SDK
+            baseurl: https://packages.cloud.google.com/yum/repos/cloud-sdk-el7-x86_64
+        - yum_repository:
+            name: docker-ce
+            description: Docker CE
+#            baseurl: https://download.docker.com/linux/centos/docker-ce.repo
+            baseurl: https://download.docker.com/linux/centos/7/$basearch/stable
+            gpgkey: https://download.docker.com/linux/centos/gpg
+            gpgcheck: yes
+      when: ansible_distribution == 'CentOS'
+      tags: install
+      
+    - block:
+      - apt_key: 
+          url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+      - apt_repository:
+          repo: deb https://packages.cloud.google.com/apt cloud-sdk main
+      - apt_key: 
+          url: https://download.docker.com/linux/debian/gpg
+      - apt_repository:
+          repo: deb [arch=amd64] https://download.docker.com/linux/debian stretch stable
+      when: ansible_distribution == 'Debian'
+      tags: install
+
+    - block:
+      - apt_key: 
+          url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+      - apt_repository:
+          repo: deb https://packages.cloud.google.com/apt cloud-sdk main
+      - apt_key: 
+          url: https://download.docker.com/linux/ubuntu/gpg
+      - apt_repository:
+          repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu bionic stable
+      when: ansible_distribution == 'Ubuntu'
+      tags: install
+      
+    - name: Remove old Docker
+      package:
+        name: "{{ item}}"
+        state: absent
+      loop:
+        - docker
+        - docker-client
+        - docker-client-latest
+        - docker-common
+        - docker-latest
+        - docker-latest-logrotate
+        - docker-logrotate
+        - docker-engine
+      tags: [ install, clean ]
+      
+    - name: Install other software
+      package:
+        name: "{{ item }}"
+      loop:
+        - sudo
+        - python-yaml
+        - git
+        - google-cloud-sdk
+        - docker-ce
+        - docker-ce-cli
+        - containerd.io
+      tags: install
+    
+    - name: Add Jenkins user
+      user:
+        name: jenkins
+      tags: config
+
+    - authorized_key:
+        user: jenkins
+        key: ""
+      tags: config
+      
+    - name: Make jenkins user sudoer
+      lineinfile:
+        dest: /etc/sudoers
+        state: present
+        line: 'jenkins	ALL=(ALL:ALL) NOPASSWD:ALL'
+        validate: 'visudo -cf %s'
+      tags: config
+        
+    - name: Add agent via jenkins script
+      become: false
+      local_action:
+        
+        module: jenkins_script
+        user: "{{ JENKINS_MASTER_USER }}"
+        password: "{{ JENKINS_MASTER_PASSWORD }}"
+        validate_certs: False
+        timeout: 120
+        url: "{{ JENKINS_URL }}"
+        script: |
+            import hudson.model.AbstractBuild
+            import hudson.model.Node
+            import hudson.plugins.sshslaves.SSHLauncher
+            import hudson.plugins.sshslaves.verifiers.NonVerifyingKeyVerificationStrategy
+            import hudson.plugins.sshslaves.verifiers.SshHostKeyVerificationStrategy
+            import hudson.slaves.ComputerLauncher
+            import hudson.slaves.DumbSlave
+            import hudson.util.VariableResolver
+            import jenkins.model.Jenkins
+            
+            Jenkins jenkins = Jenkins.getInstance()
+            
+            String nodeHostname = "{{ hostvars[inventory_hostname]['ansible_default_ipv4']['address'] }}"
+            String nodeCredentialID = "{{ JENKINS_CREDENTIALS_ID }}"
+            int nodePort = 22
+            SshHostKeyVerificationStrategy strategy = new NonVerifyingKeyVerificationStrategy()
+            
+            ComputerLauncher nodeLauncher = new SSHLauncher( nodeHostname, nodePort,
+                             nodeCredentialID, null, null, null, null, 30, 20, 10, strategy )
+            
+            String nodeName = "{{ ansible_hostname }}"
+            String nodeRemoteFS = "/home/jenkins"
+            
+            Node node = new DumbSlave( nodeName, nodeRemoteFS, nodeLauncher )
+            node.setNumExecutors(5)
+            node.setLabelString("")
+            jenkins.addNode(node)
+      tags: config
+      
+    - name: Test
+      become: false
+      tags: test
+      local_action:
+        
+        module: jenkins_script
+        user: "{{ JENKINS_MASTER_USER }}"
+        password: "{{ JENKINS_MASTER_PASSWORD }}"
+        validate_certs: False
+        timeout: 120
+        url: "{{ JENKINS_URL }}"
+        script: |
+            import hudson.model.AbstractBuild
+            import hudson.model.Node
+            import hudson.slaves.ComputerLauncher
+            import hudson.slaves.DumbSlave
+            import hudson.util.VariableResolver
+            import jenkins.model.Jenkins
+            println System.getenv("PATH")
+            println "uname -a".execute().text
+            
+            Node node = Jenkins.instance.slaves.find { agent ->
+               agent.name == "{{ ansible_hostname }}"
+            }
+            println node
+            String adcm = "by ADCM"
+            if ( node.getComputer().isTemporarilyOffline() ) {
+              println "OFFLINE !"
+              node.getComputer().setTemporarilyOffline(false,adcm)
+            } else {
+              println "UP !"
+              node.getComputer().setTemporarilyOffline(true,adcm)
+            }
+            println "END"
+
+    - name: Test
+      become: false
+      tags: hostname
+      local_action:
+        
+        module: debug
+        msg: "{{ inventory_hostname }}"
+        
+    - service:
+        name: docker
+        state: started
+      tags: service
+
+            
+
+     
+
+
